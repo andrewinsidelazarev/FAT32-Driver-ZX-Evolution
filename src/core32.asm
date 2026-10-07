@@ -73,7 +73,10 @@ BT7     LD A,0:OR A:JP Z,NXTE2
         LD A,L:AND #F0:LD L,A
         JP Snm
 
-NXMR    LD A,(EOC):OR A:RET NZ
+; Буфер NXTBU пройден: конец цепочки (EOC=#0F) или отказ чтения (#FF) — конец
+; перечисления: Z, A=0, как у нулевой записи. Прежде «OR A:RET NZ» отдавал NZ
+; без новой записи, и полный каталог от 8 КиБ перечислялся без конца.
+NXMR    LD A,(EOC):CP 1:SBC A,A:RET Z
 
         PUSH DE
         LD HL,NXTBE-#0300
@@ -156,21 +159,14 @@ LNPARS  LD A,(HL)
         CP C:JR NZ,SNM3:INC C
 
         INC L
- DUP 5
-         CALL UCH:JR NC,SNMX
- EDUP
- DUP 3
-         INC L
- EDUP
- DUP 6
-         CALL UCH:JR NC,SNMX
- EDUP
- DUP 2
-         INC L
- EDUP
- DUP 2
-         CALL UCH:JR NC,SNMX
- EDUP
+        ; 13 знаков записи LFN: 5, пропуск атрибута/типа/суммы, 6, пропуск
+        ; кластера, 2. UCHN принимает их через UCH_BOUNDED: имя длиннее 255
+        ; знаков (повреждённый каталог) прежде писало за поле вызывающего.
+        LD B,5:CALL WDOS_EXT.UCHN:JR NC,SNMX
+        INC L:INC L:INC L
+        LD B,6:CALL WDOS_EXT.UCHN:JR NC,SNMX
+        INC L:INC L
+        LD B,2:CALL WDOS_EXT.UCHN:JR NC,SNMX
         DEC L
 
         LD A,C:CP #40:JR NC,NXLEXI
@@ -278,10 +274,15 @@ LNCRC   XOR A
 NXTINI  LD HL,1
         LD (CGFL),HL
 
-        LD HL,LSTCAT:CALL GIPAG
+        ; Цепочка каталога проверяется до перечисления (DIR_LIST_OPEN):
+        ; замкнутая или уходящая за том вешала перечисление; испорчена — как
+        ; отказ GIPAG (CF=1, ABT=#FE).
+        CALL WDOS_EXT.DIR_LIST_OPEN
 
         LD HL,NXTBU,(CGPZ),HL,B,NXTBZ
-        CALL LOAD512
+        ; Недопустимый первый кластер — не читать: LOAD512 обнулил бы ABT, и
+        ; отказ выглядел бы пустым каталогом. Команда LD флагов не меняет.
+        CALL NC,LOAD512
         LD (HL),0
         RET
 
@@ -390,17 +391,23 @@ LOAD512_IO_OK:
         CP C:JR C,NXTC
 
         LD HL,(CUHL),DE,(CUDE)
-        CALL CURIT,GIPAG:JR Z,NXTC
+        ; Отказ CURIT и нулевая ссылка (свободный кластер) — ошибка потока, а
+        ; не переход по мусорному указателю или в корневой каталог.
+        CALL WDOS_EXT.STREAM_NEXT_CLUSTER:JR Z,NXTC
         RET
 
 SRHFCL  LD HL,FSTFRC,DE,CAHL,BC,4:LDIR
         CALL_WDOS_EXTENSION WDOS_EXT.ID_INIT_FREE_SCAN
 SRHFC
+        ; Сектор FAT курсора CAHL — через NEXT_FREE_FAT_SECTOR: курсор за
+        ; областью данных (испорченная подсказка) — переход к кластеру 2,
+        ; отказ чтения FAT запоминается (FREE_SCAN_IO_FAILED).
+        CALL WDOS_EXT.NEXT_FREE_FAT_SECTOR
+        RET C
 
-        LD HL,(CAHL),DE,(CADE)
-        CALL CURIT:RET C
-
-FC      CALL_WDOS_EXTENSION WDOS_EXT.ID_CHECK_FREE_SCAN_LIMIT
+; Каждый слот — CHECK_FREE_SCAN_LIMIT: кластер за областью данных тома не
+; выдаётся (последний сектор FAT держит слоты за концом данных).
+FC      CALL WDOS_EXT.CHECK_FREE_SCAN_LIMIT
         RET C
         LD A,(HL):INC HL
         OR (HL):INC HL
@@ -415,10 +422,7 @@ FC      CALL_WDOS_EXTENSION WDOS_EXT.ID_CHECK_FREE_SCAN_LIMIT
         INC (HL)
 AGA     EX DE,HL
         LD A,H:CP high SECBE:JR C,FC
-
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_NEXT_FREE_FAT_SECTOR
-        RET C
-        JP FC
+        JR SRHFC                        ; следующий сектор FAT
 GETZE   EXX
         LD HL,(CAHL),DE,(CADE)
         PUSH HL:LD HL,CAHL:CALL INC4b
@@ -459,7 +463,7 @@ GIPAG
         LD H,(HL),L,A:OR H,E,D:JR Z,RDIR
 
         EX DE,HL
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_CLASSIFY_FAT_LINK
+        CALL WDOS_EXT.CLASSIFY_IN_VOLUME ; кластер за областью данных — порча
         JR NC,GIPAG_LINK_VALID
         CALL_WDOS_EXTENSION WDOS_EXT.ID_FAT_LINK_ERROR
         RET
@@ -496,18 +500,32 @@ SVHDFL
         LD A,(EFLG):AND #10
         CALL ENTREZ_ANY_TYPE:RET NZ
         LD (CGDE),HL
+        CALL WDOS_EXT.SFN_KEEP_ATTR     ; RENAME: полный атрибут прежней записи
 
-        LD HL,(LSTCAT),DE,(LSTCAT+2)
-SHDFL   LD (CUHL),HL,(CUDE),DE
-        CALL TOS
+        ; Цепочка каталога проверяется до поиска места (DIR_STREAM_OPEN):
+        ; замкнутая вешала создание записи; испорчена — отказ носителя до
+        ; любой записи.
+SHDFL   CALL WDOS_EXT.DIR_STREAM_OPEN
+        JP C,SVHDFL_READ_ERROR
+; Отказ чтения сектора каталога прежде не проверялся: свободное место искалось
+; в прежнем содержимом LOBU, а EOC=#FF принимался за конец цепочки, и каталог
+; продлевался за текущим кластером — ссылка FAT на остаток каталога
+; затиралась, записи чужих файлов пропадали. Теперь — выход с ошибкой
+; носителя (A=#FF) до любой записи.
 NXDCL   LD HL,LOBU,B,1:CALL LOAD512
+        JP C,SVHDFL_READ_ERROR
         LD HL,LOBU,DE,32,B,16
         XOR A
 FIEL    CP (HL):JP Z,FELD
         ADD HL,DE
         DJNZ FIEL
-FIIL    LD A,(EOC):OR A:JR Z,NXDCL
-        CALL SRHFCL:JR C,IEL
+; Свободного места нет: не конец цепочки — читать дальше; конец — продлить
+; каталог (DIR_GROW): не дальше 4096 секторов. Полон или нет места — A=16,
+; отказ чтения FAT при поиске — A=#FF. DIR_GROW зовётся без шлюза: шлюз
+; разрушил бы HL' — продолжение поиска с записью нового кластера.
+FIIL    CALL WDOS_EXT.DIR_GROW
+        JR Z,NXDCL
+        RET C
         LD (BUTS),HL,(BUTS+2),DE
         EXX
         LD A,#FF
@@ -518,37 +536,48 @@ FIIL    LD A,(EOC):OR A:JR Z,NXDCL
         CALL_WDOS_EXTENSION WDOS_EXT.ID_SAVE_FAT_SECTOR
         JR NZ,IEL
 
+; Новый кластер уже занят (EOC), но ещё не в цепочке каталога. Прежде он
+; вписывался в цепочку до обнуления: отказ записи нулей оставлял в каталоге
+; прежнее содержимое свободного кластера — обрывки записей удалённых файлов
+; становились живыми, и удаление по такой записи освобождало цепочку чужого
+; файла. Теперь сначала обнуление, потом ссылка: отказ до ссылки — каталог
+; прежний, кластер потерян; ссылка легла или нет — кластер пустой. Нули
+; пишутся из LOBU (его всё равно перечитывает NXDCL): сектор FAT в SECBU
+; затирать незачем. GIPAG меняет CUHL/CUDE — последний кластер каталога в стек.
         LD HL,(CUHL),DE,(CUDE)
+        PUSH HL,DE
+        LD HL,BUTS
+        CALL GIPAG
+        JR NZ,SVHDFL_ZERO_IO_ERROR
+
+        LD HL,LOBU,B,0
+ DUP 2
+         CALL NOPING
+ EDUP
+        LD HL,LOBU,A,1:CALL SAFE_SDDSE
+        JR NZ,SVHDFL_ZERO_IO_ERROR
+
+        LD A,(BSECPC)
+        LD HL,LOBU
+        CALL_WDOS_EXTENSION WDOS_EXT.ID_ZERO_CLUSTER_TAIL
+        JR NZ,SVHDFL_ZERO_IO_ERROR
+
+        POP DE,HL                       ; последний кластер каталога
         CALL CURIT:JR C,IEL
         EX DE,HL
         LD HL,BUTS,BC,4:LDIR
         CALL_WDOS_EXTENSION WDOS_EXT.ID_SAVE_FAT_SECTOR
         JR NZ,IEL
 
+        ; Поток — на начало нового кластера (тот же GIPAG уже прошёл выше).
         LD HL,BUTS
-        CALL GIPAG:LD A,255:RET NZ
-
-        LD HL,SECBU,B,0
- DUP 2
-         CALL NOPING
- EDUP
-
-        LD HL,(LTHL),DE,(LTDE)
-        PUSH HL,DE
-        LD HL,SECBU,A,1:CALL SAFE_SDDSE
-        JR NZ,SVHDFL_ZERO_IO_ERROR
-
-        LD A,(BSECPC)
-        LD HL,SECBU
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_ZERO_CLUSTER_TAIL
-        JR NZ,SVHDFL_ZERO_IO_ERROR
-        POP DE,HL
-        CALL XPOZI
+        CALL GIPAG
         JP NXDCL
 
 SVHDFL_ZERO_IO_ERROR:
         POP DE,HL
-        JR IEL
+SVHDFL_READ_ERROR:
+        LD A,#FF:OR A:RET               ; отказ носителя
 
 IEL     LD A,16:OR A:RET
 
@@ -633,7 +662,7 @@ UR      DEC HL:LD A,(HL)
 
 NB      LD B,3
 Nb      INC HL:LD A,(HL)
-        CALL ACS,SNCEN:JR Z,NN
+        CALL WDOS_EXT.SFN_EXT_CHAR:JR Z,NN
         LD (DE),A:INC DE:DJNZ Nb
 NN      LD HL,ENTRY,DE,NXTBM,BC,32:LDIR
         LD DE,NXTBM+11,(CGDE),DE
@@ -784,7 +813,13 @@ MKSG
         CALL SGENBU:JR C,ERG1
 ROSTIK  CALL PREPFC:JR C,ERG2
         CALL BUtoFAT:RET C
-        CALL SGENB2:JR C,ERG2
+        ; GENBU сброшен, последний кластер перенесён в его начало (LSTsr).
+        ; Поиск продолжается с курсора CAHL заново: в SECBU уже сектор FAT
+        ; последней записанной ссылки, а HL' разрушен шлюзом в BUtoFAT.
+        ; Прежде здесь SGENB2 добавлял кластер мимо счётчика PREPFC, и
+        ; цепочка выходила длиннее на кластер на каждый сброс GENBU.
+        CALL WDOS_EXT.NEXT_FREE_FAT_SECTOR:JR C,ERG2
+        EXX
         JR ROSTIK
 SGENBU  LD HL,GENBU,(GARY),HL
 
@@ -801,18 +836,23 @@ GENB    LD (FSTFRC),HL,(FSTFRC+2),DE
         LD (GARY),HL
         XOR A
         RET
-SGENB2  CALL SRHFC:RET C
-        JR GENB
-PREPFC  LD HL,(CLCNT):DEC HL
-        LD (CLCNT),HL
-        LD A,H:OR L:JR Z,EOFG
+; Остаток — 32 бита: заём в старшее слово только при переходе 0000 -> FFFF.
+; Прежде при нулевом младшем слове уменьшалось старшее, а младшее шло по
+; кругу: цепочка от 65536 кластеров выходила намного длиннее нужной.
+PREPFC  LD HL,(CLCNT),DE,(CLCNT+2)
+        LD A,H:OR L:JR NZ,.low_ready
+        DEC DE
+.low_ready:
+        DEC HL
+        LD (CLCNT),HL,(CLCNT+2),DE
+        LD A,H:OR L,D,E:JR Z,EOFG
 
 AMM     EXX
         LD A,H:CP high SECBE
         JR C,ARM
         CALL SRHFC:RET C
         JR AR2
-ARM     CALL FC
+ARM     CALL FC:RET C                   ; нет места: прежде в цепочку шёл мусор
 AR2     LD (FSTFRC),HL,(FSTFRC+2),DE
         LD A,H,C,L
         LD HL,(GARY)
@@ -823,10 +863,7 @@ AR2     LD (FSTFRC),HL,(FSTFRC+2),DE
         LD A,H:CP high GENBE:RET NC
         LD (GARY),HL
         JP PREPFC
-EOFG    LD HL,(CLCNT+2)
-        LD A,H:OR L:JR NZ,AmM
-
-        LD DE,#0FFF
+EOFG    LD DE,#0FFF
         LD HL,(GARY)
         LD (HL),E:INC HL
         LD (HL),E:INC HL
@@ -834,14 +871,13 @@ EOFG    LD HL,(CLCNT+2)
         LD (HL),D:INC HL
         LD (GARY),HL
         RET
-AmM     DEC HL:LD (CLCNT+2),HL:JR AMM
 BUtoFAT LD HL,GENBU
 GENFC   LD C,(HL):INC HL
         LD B,(HL):INC HL
         LD E,(HL):INC HL
         LD D,(HL):INC HL
         PUSH HL
-        LD HL,BC:CALL CURIT:EX DE,HL
+        LD HL,BC:CALL WDOS_EXT.CURIT_CHECKED:EX DE,HL
         POP HL
 
 GNFC    LD (UUHL),HL
@@ -895,7 +931,7 @@ DLSG
         DS 5,0
 LWT     LD HL,(LOBU),DE,(LOBU+2)
         LD A,D:OR E,H,L:RET Z
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_CLASSIFY_FAT_LINK
+        CALL WDOS_EXT.CLASSIFY_DATA     ; за томом или корень — порча
         RET Z
         JR NC,DLSG_LINK_VALID
         CALL_WDOS_EXTENSION WDOS_EXT.ID_FAT_LINK_ERROR
@@ -914,7 +950,7 @@ GOCE    LD DE,LOBU,C,0
         LD A,(HL),(HL),C,(DE),A
 
         LD HL,(LOBU),DE,(LOBU+2)
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_CLASSIFY_FAT_LINK
+        CALL WDOS_EXT.CLASSIFY_DATA
         JR Z,Ne
         JR C,DLSG_BAD_LINK
         CALL DEL128
@@ -947,8 +983,10 @@ SRHDRN
         CALL_WDOS_EXTENSION WDOS_EXT.ID_REFINE_NAME_CLASSIFICATION
         CALL_WDOS_EXTENSION WDOS_EXT.ID_RESET_DIR_HISTORY
 
-FNDSN   LD HL,LSTCAT,DE,CUHL,BC,4:LDIR
-        CALL TOS
+; Цепочка каталога проверяется до поиска (DIR_STREAM_OPEN): замкнутая вешала
+; поиск; испорчена — отказ чтения.
+FNDSN   CALL WDOS_EXT.DIR_STREAM_OPEN
+        JP C,FIND_IO_ERROR
 
         LD HL,LOBU,B,1:CALL LOAD512
         JP C,FIND_IO_ERROR
@@ -1076,7 +1114,6 @@ LNEB    LD A,L:AND #F0:LD L,A
         LD A,(HL):CP #0F:JP NZ,ENTCHE
 
         LD DE,(CGDE):INC DE
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_BEGIN_LFN_COMPARE
         LD A,L:AND #F0:LD L,A
 
         LD B,1
@@ -1160,9 +1197,16 @@ Dee     ADD A,#A0:RET
 Hyo     LD A,#F0:RET
 Lyo     LD A,#F1:RET
 
+; Запись удалена (DELEN, NZ), но цепочку освободить не удалось (DLSG вернул
+; NZ) — прежде возвращался «успех», и сбой FAT скрывался. Теперь неудача: Z,
+; A=0, как у отказа записи каталога в DELEN.
 DELFL
 
         CALL DELEN:RET Z
+        LD HL,FCTS:CALL DLSG
+        LD A,1:JR Z,$+3:DEC A
+        OR A
+        RET
 DELCHA  PUSH AF:LD HL,FCTS:CALL DLSG
         POP AF
         RET
@@ -1185,75 +1229,28 @@ STAMP   PUSH HL
         POP HL
 
         LD A,1:JP SAFE_SDDSE
-RENAME
-
-        PUSH HL,DE
-        CALL SRHDRN:LD A,8
-        LD (FCTS+0),HL
-        LD (FCTS+2),DE
-        POP HL,DE:RET Z
-
-        PUSH DE:CALL SVHDFL
-        POP HL:JR NZ,ZIR
-
-        CALL DELEN:RET Z
-
-        XOR A:INC A:RET
-ZIR     CP A:RET
+; Последовательность и откат — RENAME_ENTRY (safety.asm): если прежнюю запись
+; удалить не удалось, новая удаляется, чтобы две записи не делили одну
+; цепочку. Вход и выход прежние.
+RENAME  JP WDOS_EXT.RENAME_ENTRY
 MKFILE
 
         LD A,(HL),(EFLG),A:INC HL
         LD DE,SIZIK,BC,4:LDIR
         LD (CGHL),HL
+        CALL WDOS_EXT.NAME_PRECHECK     ; недопустимое имя — до выделения
+        RET NZ
+        CALL WDOS_EXT.DIR_CHECK         ; испорченный каталог — до выделения
+        RET NZ
 
         LD HL,(SIZIK),DE,(SIZIK+2)
         CALL_WDOS_EXTENSION WDOS_EXT.ID_ALLOCATE_FILE
         RET NZ
-        LD HL,(CGHL)
-        CALL SVHDFL:JP NZ,DELCHA
-        XOR A
-        RET
+        JP WDOS_EXT.MKFILE_TAIL         ; запись в каталог (safety.asm)
 
-MKDIR
-
-        LD (CGHL),HL
-        LD HL,0,(SIZIK),HL,(SIZIK+2),HL
-        LD A,#10,(EFLG),A
-        LD DE,0,HL,512
-        CALL MKSG:RET NZ
-        LD HL,(CGHL)
-        CALL SVHDFL:JP NZ,DELCHA
-        LD HL,FCTS
-        CALL GIPAG
-
-        LD HL,ENTRY
-        LD (HL),".":INC HL
-        LD (HL),#20:INC HL
-        LD A,32,B,9:CALL NOPING+1
-        LD HL,(CUHL),(CLSHL),HL
-        LD HL,(CUDE),(CLSDE),HL
-        LD HL,ENTRY,DE,LOBU,BC,32:LDIR
-
-        LD HL,ENTRY+1
-        LD (HL),"."
-        LD HL,(LSTCAT),(CLSHL),HL
-        LD HL,(LSTCAT+2),(CLSDE),HL
-        LD HL,ENTRY,BC,32:LDIR
-
-        LD HL,DE:INC DE
-        LD BC,512
-        LD (HL),0
-        LDIR
-        LD HL,LOBU
-        LD A,1:CALL SAFE_SDDSE
-        RET NZ
-
-        LD A,(BSECPC)
-        LD HL,LOBU+64
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_ZERO_CLUSTER_TAIL
-        RET NZ
-        XOR A
-        RET
+; Тело каталога («.», «..», обнулённый хвост кластера) пишется до записи в
+; родителе — MKDIR_ENTRY (safety.asm). Вход и выход прежние.
+MKDIR   JP WDOS_EXT.MKDIR_ENTRY
 
 RFRH    CALL_WDOS_EXTENSION WDOS_EXT.ID_RFRH_SAFE
         RET
@@ -1274,7 +1271,7 @@ CKAGO   LD (DAHL),HL
         LD A,(HL):INC HL
         LD H,(HL),L,A:EX DE,HL
 
-        CALL CURIT
+        CALL CURIT:JP C,GIPP_BAD_LINK   ; HL — мусор: дальше не идти
         JR CKAGO
 
 CLUSSEC
@@ -1300,7 +1297,7 @@ GIPP
         LD A,(HL):INC HL
         LD H,(HL),L,A:OR H,E,D:RET Z
         EX DE,HL
-        CALL_WDOS_EXTENSION WDOS_EXT.ID_CLASSIFY_FAT_LINK
+        CALL WDOS_EXT.CLASSIFY_IN_VOLUME
         JR C,GIPP_BAD_LINK
         RET Z
 
@@ -1328,6 +1325,8 @@ HDD
         LD (DUHL),HL,(DUDE),HL
         LD (EXTBAS),HL,(EXTBAS+2),HL
         LD (EXTCUR),HL,(EXTCUR+2),HL
+        LD (PARTSZ),HL,(PARTSZ+2),HL
+        LD (EXTVOL),HL
         CALL XPOZI
         LD HL,LOBU,A,1:CALL SAFE_RDDSE
         RET NZ
@@ -1357,37 +1356,41 @@ FHDD_EXTENDED:
 
         LD HL,COUNT:DEC (HL):JP Z,NHDD  ; ограничение глубины обхода
 
-        ; Логический том этого EBR: его смещение отсчитывается от EBR.
-        LD BC,(EXTCUR):LD (CLHL),BC
-        LD BC,(EXTCUR+2):LD (CLDE),BC
-        LD HL,(LOBU+446+8),DE,(LOBU+446+8+2)
-        CALL ADD4BF
-        PUSH DE:PUSH HL
-
-        ; Ссылка на следующий EBR отсчитывается от первого EBR, а не от
-        ; текущего. Нулевая ссылка означает последний EBR в цепочке.
-        LD HL,(LOBU+446+16+8),DE,(LOBU+446+16+8+2)
-        LD A,H:OR L:OR D:OR E
-        JR Z,FHDD_EXT_STORE
-        LD BC,(EXTBAS):LD (CLHL),BC
-        LD BC,(EXTBAS+2):LD (CLDE),BC
-        CALL ADD4BF
-FHDD_EXT_STORE:
-        LD (EXTCUR),HL
-        LD (EXTCUR+2),DE
-        POP HL:POP DE
+        ; Логический том этого EBR: его смещение отсчитывается от EBR, длина —
+        ; граница тома (PARTSZ). Ссылка на следующий EBR отсчитывается от
+        ; первого EBR, а не от текущего; нулевая — последний EBR в цепочке.
+        ; Начало тома за 2**32 — EBR испорчен, обход кончается (EBR_ENTRY).
+        CALL WDOS_EXT.EBR_ENTRY
+        JP C,NHDD
         JP LDBPB
 
 OKK     INC HL,HL,HL,HL
+        PUSH AF                         ; тип раздела
+        PUSH HL                         ; запись+8: начало раздела, +12: длина
+        LD BC,4:ADD HL,BC
+        LD DE,PARTSZ,BC,4:LDIR
+        POP HL
         LD E,(HL):INC HL
         LD D,(HL):INC HL
         LD A,(HL):INC HL
         LD H,(HL),L,A
         EX DE,HL
+        POP AF
 
         ; Начало найденного раздела. Для типов #05/#0F здесь лежит первый
         ; EBR: запоминаем его как базу и как текущий шаг обхода. Без этого
         ; обход стартовал с LBA 0 и логический том не находился никогда.
+        ; У тома FAT32 (#0B/#0C) обхода нет: прежде его неудачный BPB читался
+        ; как EBR.
+        LD BC,0
+        CP #05:JR Z,OKK_EXTENDED
+        CP #0F:JR Z,OKK_EXTENDED
+        LD (EXTCUR),BC
+        LD (EXTCUR+2),BC
+        JR LDBPB
+OKK_EXTENDED:
+        LD BC,(PARTSZ):LD (EXTSZ),BC
+        LD BC,(PARTSZ+2):LD (EXTSZ+2),BC
         LD (EXTBAS),HL
         LD (EXTBAS+2),DE
         LD (EXTCUR),HL
@@ -1403,7 +1406,7 @@ LDBPB   LD (ADDTOP),HL,(ADDTOP+2),DE
         LD HL,(LOBU+11)
         LD A,H:DEC A,A:OR L:JP NZ,FHDD
         LD A,(LOBU+13):OR A:JP Z,FHDD
-        LD A,(LOBU+14):OR A:JP Z,FHDD
+        LD HL,(LOBU+14):LD A,H:OR L:JP Z,FHDD  ; резерв — 16 бит, не младший байт
         LD A,(LOBU+16):OR A:JP Z,FHDD
 
         LD HL,(LOBU+17),A,H:OR L
@@ -1442,12 +1445,17 @@ NER     OR A:JP NZ,FHDD
         LD (CGFL),HL
 
         CALL_WDOS_EXTENSION WDOS_EXT.ID_LOAD_FREE_HINT
-        DS 4,0
+        JP NZ,FHDD                      ; в томе нет области данных — неверный BPB
+        DS 1,0
 
         CALL TOS
         RET
 
-NHDD    LD HL,(DUHL),DE,(DUDE)
+NHDD    LD HL,0
+        LD (EXTVOL),HL
+        DEC HL                          ; том с LBA 0: границы раздела нет —
+        LD (PARTSZ),HL,(PARTSZ+2),HL    ; #FFFFFFFF (ноль — пустой раздел)
+        LD HL,(DUHL),DE,(DUDE)
         XOR A:LD (ZES),A
         JP LDBPB
 
@@ -1568,7 +1576,6 @@ SAFE_IO_PREPARE:
         POP AF
         JP SAFE_IO_DISPATCH
 
-EXT_LFN_LEADING            DS 1
 EXT_DIR_PREVIOUS_LBA       DS 4
 EXT_DIR_OLDER_LBA          DS 4
 EXT_DIR_OLDER_VALID        DS 1
@@ -1630,6 +1637,14 @@ ZES     NOP
 ; потому что те же DAHL/DADE служат временными значениями CHTOSE.
 EXTBAS  DS 4
 EXTCUR  DS 4
+; Длина раздела, на котором ищется том (запись MBR или EBR); 0 — не задана
+; (том с LBA 0, MOUNT_AT). LOAD_FREE_HINT не монтирует том длиннее раздела.
+PARTSZ  DS 4
+; Расширенный раздел из MBR (EXTBAS — его начало, EXTSZ — длина) и признак
+; того, что том ищется по цепочке EBR (EXTVOL≠0): тогда логический том обязан
+; лежать внутри расширенного раздела (GEOMETRY_CHECK).
+EXTSZ   DS 4
+EXTVOL  DS 2
 
 
 EXTENSION_GATE_AFTER:

@@ -18,6 +18,7 @@ FAT_INFORMATION:
 FAT_INVALIDATE:
         XOR A
         LD (FAT_SELECTED),A
+        LD (WDOS_EXT.FILE_CHAIN_OK),A
         LD (WDOS_EXT.APPEND_VALID),A
         LD (WDOS_EXT.APPEND_READY),A
         LD (WDOS_EXT.APPEND_LBA_VALID),A
@@ -71,6 +72,13 @@ FAT_MOUNT:
 FAT_MOUNT_AT:
         CALL FAT_MOUNT_PREPARE
         RET C
+        PUSH HL
+        LD HL,0
+        LD (WDOS.EXTVOL),HL
+        DEC HL                          ; раздел не задан: границу даёт сам BPB
+        LD (WDOS.PARTSZ),HL             ; (#FFFFFFFF)
+        LD (WDOS.PARTSZ+2),HL
+        POP HL
         XOR A
         LD (WDOS.ZES),A
         CALL WDOS.LDBPB
@@ -135,6 +143,8 @@ FAT_CAPTURE:
 FAT_SEEK_START:
         CALL FAT_REQUIRE_FILE
         RET C
+        LD A,(WDOS_EXT.FILE_CHAIN_OK):AND #FD     ; поток ещё не открыт
+        LD (WDOS_EXT.FILE_CHAIN_OK),A
         LD HL,(WDOS_EXT.APPEND_ENTRY+26)
         LD (FAT_CLUSTER),HL
         LD DE,(WDOS_EXT.APPEND_ENTRY+20)
@@ -146,16 +156,25 @@ FAT_SEEK_START:
         JR NZ,.seek
         ; У пустого файла кластер равен нулю. Старое ядро считает это корнем
         ; каталога; для обычного файла такое толкование недопустимо.
-        LD A,#0F
-        LD (WDOS.EOC),A
+        CALL WDOS_EXT.FAT_STREAM_OPEN_EMPTY
         XOR A
         RET
 .seek:
+        ; Цепочка файла проверяется до первого чтения или записи: цикл,
+        ; кластер корня или выход за том — файл не выбирается (#FE). Прежде
+        ; файл на кластере корня читался как корень, а SAVE512 затирал корень.
+        CALL WDOS_EXT.FILE_CHAIN_GUARD
+        JR C,.corrupt
         LD HL,FAT_CLUSTER
         CALL WDOS.GIPAG
         RET C
+        CALL WDOS_EXT.FAT_STREAM_SAVE
         XOR A
         RET
+.corrupt:
+        CALL FAT_INVALIDATE
+        LD A,#FE
+        JP FAT_ERROR
 FAT_PREPARE_CREATE:
         CALL FAT_INVALIDATE
         PUSH HL
@@ -167,6 +186,10 @@ FAT_PREPARE_CREATE:
 FAT_CREATE:
         CALL FAT_REQUIRE_MOUNT
         RET C
+        ; Атрибут файла — «только чтение», «скрытый», «системный», «архив»
+        ; (#27). Каталог создаёт MKDIR: прежде бит каталога давал «каталог»,
+        ; чьё тело — старые данные свободных кластеров.
+        LD A,(HL):AND ~#27:JP NZ,FAT_BAD_ARGUMENT
         CALL FAT_PREPARE_CREATE
         CALL WDOS.MKFILE
         OR A
@@ -175,8 +198,13 @@ FAT_CREATE:
         ; ENTREZ хранит [тип,имя,0] в NXTBU; найдём зафиксированную запись.
         LD HL,WDOS.NXTBU
         CALL WDOS.SRHDRN
-        JP Z,FAT_BAD_ARGUMENT
-        JP FAT_CAPTURE
+        JP NZ,FAT_CAPTURE
+        ; Файл уже создан, а поиск его записи не прочитал каталог: код отказа
+        ; носителя (прежде — «неверный аргумент», #F3).
+        LD A,(WDOS.ABT)
+        OR A
+        JP NZ,FAT_ERROR
+        JP FAT_BAD_ARGUMENT
 FAT_MKDIR:
         CALL FAT_REQUIRE_MOUNT
         RET C
@@ -186,13 +214,13 @@ FAT_MKDIR:
         JP NZ,FAT_ERROR
         JP FAT_INVALIDATE
 FAT_DELETE:
-        CALL FAT_REQUIRE_MOUNT
+        CALL FAT_DOT_GUARD
         RET C
         CALL FAT_INVALIDATE
         CALL WDOS.DELFL
         JR FAT_MUTATION_FINISH
 FAT_RENAME:
-        CALL FAT_REQUIRE_MOUNT
+        CALL FAT_DOT_GUARD
         RET C
         CALL FAT_INVALIDATE
         CALL WDOS.RENAME
@@ -207,13 +235,38 @@ FAT_MUTATION_FINISH:
         JP NZ,FAT_INVALIDATE
         OR A
         JP NZ,FAT_ERROR
-        LD A,FAT32_BAD_ARGUMENT
+        ; A=0 без кода в ABT: RENAME откатил новую запись после отказа
+        ; носителя (последующие чтения обнулили ABT) — это отказ носителя.
+        LD A,#FF
         JP FAT_ERROR
 .media_error:
         POP BC
         JP FAT_ERROR
+; Том смонтирован, и имя запроса HL ([флаг, имя, 0]) — не «.» и не «..»:
+; служебные записи каталога не удаляются и не переименовываются. Прежде DELETE
+; «..» освобождал цепочку родительского каталога, а RENAME ломал ссылку на
+; него. CF=1 — отказ (#F0 — не смонтирован, #F3 — служебное имя). HL, DE
+; сохраняются.
+FAT_DOT_GUARD:
+        CALL FAT_REQUIRE_MOUNT
+        RET C
+        PUSH HL
+        INC HL
+        LD A,(HL):CP ".":JR NZ,.name
+        INC HL
+        LD A,(HL):OR A:JR Z,.dot
+        CP ".":JR NZ,.name
+        INC HL
+        LD A,(HL):OR A:JR NZ,.name
+.dot:
+        POP HL
+        JP FAT_BAD_ARGUMENT
+.name:
+        POP HL
+        OR A                            ; CF=0
+        RET
 FAT_VALIDATE_STREAM:
-        CALL FAT_REQUIRE_FILE
+        CALL WDOS_EXT.FAT_REQUIRE_OPEN
         RET C
         LD A,B:OR A:JP Z,FAT_BAD_ARGUMENT
         LD A,H:CP #80:JR C,FAT_BAD_BUFFER
@@ -238,24 +291,45 @@ FAT_BAD_BUFFER:
 FAT_READ:
         CALL FAT_VALIDATE_STREAM
         RET C
-        JP WDOS.LOAD512
+        CALL WDOS_EXT.FAT_STREAM_RESTORE
+        RET C                           ; отказ продолжения потока: CF=1
+        CALL WDOS.LOAD512
+        JP WDOS_EXT.FAT_STREAM_KEEP
 FAT_WRITE:
         CALL FAT_VALIDATE_STREAM
         RET C
         LD A,(WDOS_EXT.APPEND_ENTRY+11)
         AND #11
         JP NZ,FAT_BAD_ARGUMENT
-        JP WDOS.SAVE512
+        CALL WDOS_EXT.FAT_STREAM_RESTORE
+        RET C
+        CALL WDOS.SAVE512
+        JP WDOS_EXT.FAT_STREAM_KEEP
+FAT_READ_VIDEO:
+        CALL WDOS_EXT.FAT_VIDEO_CHECK   ; 1024 байта адресов на сектор
+        RET C
+        CALL WDOS_EXT.FAT_STREAM_RESTORE
+        RET C
+        CALL WDOS.LOAD256
+        JP WDOS_EXT.FAT_STREAM_KEEP
+FAT_SKIP:
+        CALL WDOS_EXT.FAT_REQUIRE_OPEN
+        RET C
+        LD A,B:OR A:JP Z,FAT_BAD_ARGUMENT
+        CALL WDOS_EXT.FAT_STREAM_RESTORE
+        RET C
+        CALL WDOS.LOADNON
+        JP WDOS_EXT.FAT_STREAM_KEEP
 FAT_APPEND:
         CALL FAT_REQUIRE_FILE
         RET C
         LD A,H:CP #80
-        JR C,FAT_BAD_BUFFER
+        JP C,FAT_BAD_BUFFER
         JP WDOS.APPEND
 FAT_FILEX:
         ; QUERY_CAPS доступен до подключения устройства и монтирования тома.
-        LD A,H:CP #80:JR C,FAT_BAD_BUFFER
-        CP #C0:JR NC,FAT_BAD_BUFFER
+        LD A,H:CP #80:JP C,FAT_BAD_BUFFER
+        CP #C0:JP NC,FAT_BAD_BUFFER
         PUSH HL
         INC HL:INC HL
         LD A,(HL)

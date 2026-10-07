@@ -2,6 +2,16 @@
         INCLUDE "fat32.inc"
         INCLUDE "filex.inc"
         INCLUDE "extension_ids.inc"
+
+; Рабочая страница #0000-#3FFF (fat32-work.bin): GENBU/NXTBU #0000-#1FFF,
+; нулевой буфер FILEX #2000-#23FF (он же DIR_OLDER_BUFFER #2000-#21FF), код и
+; таблицы проверок сохранности данных (src/safety.asm) #2400-#2FFF, SECBU
+; #3000, LOBU #3200, LOBU2 #3400, переменные ядра с #3800, таблица порта с #3900.
+FAT32_ZERO_SCRATCH      EQU #2000
+FAT32_ZERO_SCRATCH_SIZE EQU #0400
+FAT32_LOW_CODE          EQU FAT32_ZERO_SCRATCH+FAT32_ZERO_SCRATCH_SIZE
+FAT32_LOW_END           EQU #3000
+
         ORG FAT32_BASE
 
 API_TABLE:
@@ -32,8 +42,8 @@ API_TABLE:
         JP WDOS.CHTOSE                   ; 24
         JP FAT_NOT_SUPPORTED             ; 25
         JP FAT_FIND                      ; 26
-        JP WDOS.LOAD256                  ; 27
-        JP WDOS.LOADNON                  ; 28
+        JP FAT_READ_VIDEO                ; 27: LOAD256 выбранного файла
+        JP FAT_SKIP                      ; 28: LOADNON выбранного файла
         JP WDOS.NXTETY                   ; 29
         JP WDOS.NXTETY2                  ; 30
         JP FAT_SET_DIR                   ; 31
@@ -57,8 +67,8 @@ API_TABLE:
         JP FAT_NOT_SUPPORTED             ; 57: STREAM переключает панели WC
         JP WDOS.NXTETY2                  ; 58
         JP FAT_FIND                      ; 59
-        JP WDOS.LOAD256                  ; 60
-        JP WDOS.LOADNON                  ; 61
+        JP FAT_READ_VIDEO                ; 60
+        JP FAT_SKIP                      ; 61
         JP FAT_SEEK_START                ; 62: GFILE
         JP FAT_SET_DIR                   ; 63: GDIR
         DUP 8                           ; 64..71
@@ -90,3 +100,17 @@ START EQU @API_TABLE
 CODE_END:
         ASSERT CODE_END <= #8000, FAT32 code exceeds the 16 KiB code window
         SAVEBIN "build/fat32.bin",FAT32_BASE,CODE_END-FAT32_BASE
+
+; Проверки сохранности данных — в рабочей странице: собираются в свободном
+; окне #C000 устройства ассемблера с адресами исполнения FAT32_LOW_CODE;
+; build.py кладёт образ в fat32-work.bin.
+        ORG #C000
+LOW_IMAGE:
+        DISP FAT32_LOW_CODE
+        MODULE WDOS_EXT
+        INCLUDE "safety.asm"
+        ENDMODULE
+LOW_END:
+        ENT
+        ASSERT LOW_END <= FAT32_LOW_END, safety code exceeds the work-page window
+        SAVEBIN "build/fat32-low.bin",LOW_IMAGE,LOW_END-FAT32_LOW_CODE

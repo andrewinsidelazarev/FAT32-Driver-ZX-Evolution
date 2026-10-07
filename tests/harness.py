@@ -175,6 +175,8 @@ class Driver:
         self.cpu = z80.Z80Machine()
         self.ram = self.cpu.memory
         self.cpu.set_memory_block(0x4000, (build/'fat32.bin').read_bytes())
+        # Рабочая страница: в ней код проверок safety.asm (и таблица порта SD-ZC).
+        self.cpu.set_memory_block(0x0000, (build/'fat32-work.bin').read_bytes())
         self.operations, self.fail, self.syncs = [], None, 0
         for address in (STOP,INIT,READ,WRITE,SYNC):
             self.cpu.set_breakpoint(address)
@@ -199,7 +201,7 @@ class Driver:
         self.ram[STACK:STACK+2] = STOP.to_bytes(2,'little')
         for name, value in regs.items():
             setattr(self.cpu,name,value)
-        for _ in range(40000):
+        for _ in range(getattr(self, 'max_events', 40000)):
             self.cpu.ticks_to_stop = 1_000_000
             event = self.cpu.run()
             if not event & 2:

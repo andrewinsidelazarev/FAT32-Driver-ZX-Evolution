@@ -29,19 +29,29 @@ def main():
     image = (BUILD/'fat32.bin').read_bytes()
     work = bytearray(16384)
     port = (BUILD/'port_sdzc.bin').read_bytes()
+    # Код проверок сохранности данных (src/safety.asm) исполняется в рабочей
+    # странице: адреса окна берутся из символов сборки.
+    sym = {m[0].strip(): int(m[1], 16) for line in (BUILD/'fat32.sym').read_text().splitlines()
+           if (m := line.split(': EQU ')) and len(m) == 2}
+    low = (BUILD/'fat32-low.bin').read_bytes()
+    low_start, low_end = sym['FAT32_LOW_CODE'], sym['FAT32_LOW_END']
     if not (384 <= len(image) <= 16384 and len(port) <= 0x700):
         raise SystemExit('Образы драйвера не помещаются в выделенные окна памяти.')
+    if not (0x2000 <= low_start and low_start + len(low) <= low_end <= 0x3000):
+        raise SystemExit('Код safety.asm не помещается в рабочую страницу.')
     if any(image[slot*3] != 0xC3 for slot in range(128)):
         raise SystemExit('Повреждена фиксированная таблица JP.')
+    work[low_start:low_start+len(low)] = low
     work[0x3900:0x3900+len(port)] = port
     (BUILD/'fat32-work.bin').write_bytes(work)
     (BUILD/'manifest.json').write_text(json.dumps({
         'size':len(image), 'sha256':hashlib.sha256(image).hexdigest(),
         'api_base':16384, 'api_version':1, 'command_count':128,
         'reserved_first':78, 'code_limit':32768, 'code_free_bytes':16384-len(image),
+        'low_code':low_start, 'low_free_bytes':low_end-low_start-len(low),
         'artifacts':{name:{'size':(BUILD/name).stat().st_size,
                            'sha256':hashlib.sha256((BUILD/name).read_bytes()).hexdigest()}
-                     for name in ('fat32.bin','fat32-work.bin','port_sdzc.bin')},
+                     for name in ('fat32.bin','fat32-low.bin','fat32-work.bin','port_sdzc.bin')},
         'sources':{str(p.relative_to(ROOT)).replace('\\','/'):
                        hashlib.sha256(p.read_bytes()).hexdigest()
                    for p in sorted([ROOT/'build.py'] +

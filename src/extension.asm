@@ -11,7 +11,7 @@ ENTRY_TABLE:
         JP NEXT_FREE_FAT_SECTOR
         JP FAT_SECTOR_IN_RANGE
         JP POSITION_FAT_READ
-        JP CLASSIFY_FAT_LINK
+        JP CLASSIFY_IN_VOLUME           ; ссылка за областью данных — порча
         JP FAT_LINK_ERROR
         JP SAVE_FAT_SECTOR
         JP REFINE_NAME_CLASSIFICATION
@@ -127,6 +127,7 @@ COPY_ENTRY_AND_CAPTURE:
         LD (APPEND_VALID),A
         LD (APPEND_READY),A
         LD (APPEND_LBA_VALID),A
+        LD (FILE_CHAIN_OK),A
         LD BC,(APPEND_FOUND_POINTER)
         LD A,C:AND #1F:JR NZ,.copy_saved_entry
         LD A,B:SUB high @WDOS.LOBU:CP 4:JR NC,.copy_saved_entry
@@ -165,6 +166,7 @@ FILEX_CONTEXT_BRIDGE:
         LD (APPEND_VALID),A
         LD (APPEND_READY),A
         LD (APPEND_LBA_VALID),A
+        LD (FILE_CHAIN_OK),A
         RET
 .import:
         LD DE,APPEND_DIRECTORY_LBA,BC,38
@@ -172,6 +174,7 @@ FILEX_CONTEXT_BRIDGE:
         XOR A
         LD (APPEND_READY),A
         LD (APPEND_LBA_VALID),A
+        LD (FILE_CHAIN_OK),A
         INC A
         LD (APPEND_VALID),A
         OR A
@@ -185,6 +188,7 @@ APPEND_ERROR_SIZE_OVERFLOW EQU #24
 APPEND_ERROR_BAD_CHAIN     EQU #25
 APPEND_ERROR_IS_DIRECTORY  EQU #26
 APPEND_ERROR_INTERNAL      EQU #27
+APPEND_ERROR_READ_ONLY     EQU #28
 APPEND_ERROR_ROLLBACK      EQU #2A
 
 APPEND_BYTES:
@@ -200,8 +204,8 @@ APPEND_BYTES:
         JP NZ,.bad_length
         LD A,C:OR A:JP NZ,.bad_length
 .length_ok:
-        LD A,H:CP #20:JP C,.bad_buffer
-        CP #30:JR C,.scratch_buffer
+        LD A,H:CP high FAT32_ZERO_SCRATCH:JP C,.bad_buffer
+        CP high FAT32_LOW_CODE:JR C,.scratch_buffer
         CP #80:JP C,.bad_buffer
         PUSH HL
         ADD HL,BC
@@ -209,10 +213,11 @@ APPEND_BYTES:
         LD A,H:OR L:JP NZ,.bad_buffer_pop
         JR .buffer_end_ok
 .scratch_buffer:
-        ; FILEX использует внутренний нулевой буфер 4 КиБ при увеличении файла.
+        ; FILEX использует внутренний нулевой буфер FAT32_ZERO_SCRATCH при
+        ; увеличении файла; за ним в рабочей странице — код safety.asm.
         PUSH HL
         ADD HL,BC
-        LD A,H:CP #30:JR C,.buffer_end_ok
+        LD A,H:CP high FAT32_LOW_CODE:JR C,.buffer_end_ok
         JP NZ,.bad_buffer_pop
         LD A,L:OR A:JP NZ,.bad_buffer_pop
 .buffer_end_ok:
@@ -364,6 +369,7 @@ APPEND_BYTES:
 .commit:
         CALL APPEND_COMMIT
         JR NZ,.failed_with_rollback
+.committed:
         LD HL,APPEND_WORK_CONTEXT,DE,APPEND_CONTEXT,BC,APPEND_CONTEXT_SIZE
         LDIR
         XOR A
@@ -376,9 +382,23 @@ APPEND_BYTES:
 
 .failed_with_rollback:
         LD (APPEND_LAST_ERROR),A
+        ; Отказ записи сектора каталога неоднозначен: сектор мог лечь. Тогда
+        ; фиксация состоялась (Z), и откат освободил бы живую цепочку; исход
+        ; неизвестен (CF=1) — цепочку не трогать.
+        CALL APPEND_DIR_OUTCOME
+        JR Z,.committed
+        JR C,.unknown
         CALL APPEND_ROLLBACK
         JR Z,.restore_original_error
         LD A,APPEND_ERROR_ROLLBACK
+        JR .forget
+; Исход неизвестен (сектор каталога не перечитался) или откат не удался:
+; контекст APPEND больше не описывает носитель. Прежде он оставался, и
+; повторный APPEND без FIND писал данные по старому размеру поверх уже легших.
+.unknown:
+        LD A,(APPEND_LAST_ERROR)
+.forget:
+        CALL CONTEXT_FORGET                     ; и выбор файла, и поток READ/WRITE
         JR .return_error
 .restore_original_error:
         LD A,(APPEND_LAST_ERROR)
@@ -411,6 +431,12 @@ APPEND_PREPARE:
         LD A,(APPEND_ENTRY+11):BIT 4,A
         LD A,APPEND_ERROR_IS_DIRECTORY
         RET NZ
+        LD A,(APPEND_ENTRY+11):BIT 0,A
+        LD A,APPEND_ERROR_READ_ONLY             ; прежде APPEND писал и в него
+        RET NZ
+        CALL FILE_CHAIN_GUARD                   ; цикл, корень, за томом
+        LD A,APPEND_ERROR_BAD_CHAIN
+        RET C
 
         LD HL,(APPEND_ENTRY+28),DE,(APPEND_ENTRY+30)
         LD (APPEND_SIZE),HL
@@ -480,7 +506,7 @@ APPEND_PREPARE:
         LD A,1
         LD (APPEND_NEEDS_CLUSTER),A
         DEC HL
-        LD A,H:CP #FF:JR NZ,.store_skip
+        LD A,H:AND L:CP #FF:JR NZ,.store_skip  ; прежде заём и при FF01..FFFF
         DEC DE
 .store_skip:
         LD (APPEND_SKIP_COUNT),HL
@@ -497,7 +523,7 @@ APPEND_PREPARE:
         LD (APPEND_CURRENT_CLUSTER+2),DE
         LD HL,(APPEND_SKIP_COUNT),DE,(APPEND_SKIP_COUNT+2)
         DEC HL
-        LD A,H:CP #FF:JR NZ,.skip_stored
+        LD A,H:AND L:CP #FF:JR NZ,.skip_stored
         DEC DE
 .skip_stored:
         LD (APPEND_SKIP_COUNT),HL
@@ -524,7 +550,7 @@ APPEND_READ_FAT_LINK:
         LD A,(HL):INC HL
         LD H,(HL),L,A
         EX DE,HL
-        JP CLASSIFY_FAT_LINK
+        JP CLASSIFY_FILE_LINK           ; в томе и не кластер корня
 
 APPEND_PREALLOCATE:
         LD A,(APPEND_WORK_NEEDS_CLUSTER):OR A:JR NZ,.allocate_all
@@ -558,7 +584,7 @@ APPEND_PREALLOCATE:
         LD (APPEND_PENDING_OLD_TAIL+2),DE
         POP HL
         LD DE,0
-        CALL @WDOS.MKSG
+        CALL MKSG_CHECKED               ; отказ чтения FAT — #FF, не 16
         RET NZ
 
         LD HL,(@WDOS.FCTS),DE,(@WDOS.FCTS+2)
@@ -699,6 +725,7 @@ APPEND_CLEAR_SECTOR:
         RET
 
 APPEND_COMMIT:
+        XOR A:LD (APPEND_DIR_ATTEMPTED),A
         LD A,(APPEND_PENDING_NEW):OR A:JR Z,.directory
         LD HL,(APPEND_PENDING_OLD_TAIL),DE,(APPEND_PENDING_OLD_TAIL+2)
         LD A,D:OR E:OR H:OR L:JR Z,.fsinfo
@@ -781,13 +808,18 @@ APPEND_UPDATE_DIRECTORY:
         LD DE,(APPEND_WORK_SIZE+2)
         LD (HL),E:INC HL:LD (HL),D
 
+        ; Новая запись — на случай неоднозначного отказа записи (APPEND_DIR_OUTCOME).
+        LD HL,(APPEND_SLOT_POINTER),DE,APPEND_NEW_ENTRY,BC,32
+        LDIR
+        LD A,1:LD (APPEND_DIR_ATTEMPTED),A
         LD HL,(APPEND_DIRECTORY_LBA),DE,(APPEND_DIRECTORY_LBA+2)
         CALL @WDOS.PROZ
         LD HL,@WDOS.LOBU,A,1
         CALL WRITE_SECTORS
         RET NZ
-
-        LD HL,(APPEND_SLOT_POINTER),DE,APPEND_ENTRY,BC,32
+APPEND_ENTRY_COMMITTED:
+        XOR A:LD (APPEND_DIR_ATTEMPTED),A
+        LD HL,APPEND_NEW_ENTRY,DE,APPEND_ENTRY,BC,32
         LDIR
         LD HL,APPEND_ENTRY,DE,@WDOS.ENTRY,BC,32
         LDIR
@@ -914,15 +946,31 @@ FAT_LINK_ERROR:
         SCF
         RET
 
+; Короткое имя 8.3 запроса (ENTRY) годно, только если оно и есть весь запрос:
+; пробел в имени и точка в конце (кроме служебных «.» и «..») переводят поиск
+; на длинное имя. Прежде точка в конце терялась: «foo.» давало ту же форму 8.3,
+; что и «foo», и FIND, DELETE, RENAME отсутствующего «foo.» брали файл FOO (а
+; «алиас.» — файл с этим коротким алиасом).
 REFINE_NAME_CLASSIFICATION:
         PUSH HL
         LD HL,(@WDOS.CGDE)
         INC HL
 .scan:
-        LD A,(HL):OR A:JR Z,.done
+        LD A,(HL):OR A:JR Z,.end
         CP " ":JR Z,.force_lfn
         INC HL
         JR .scan
+.end:
+        DEC HL
+        LD A,(HL):CP ".":JR NZ,.done
+        LD HL,(@WDOS.CGDE)
+        INC HL
+        CP (HL):JR NZ,.force_lfn                ; не с точки — не служебное
+        INC HL
+        LD A,(HL):OR A:JR Z,.done               ; «.»
+        CP ".":JR NZ,.force_lfn
+        INC HL
+        LD A,(HL):OR A:JR Z,.done               ; «..»
 .force_lfn:
         XOR A:LD (@WDOS.ENTRY),A
 .done:
@@ -930,12 +978,21 @@ REFINE_NAME_CLASSIFICATION:
         LD A,1:OR A
         RET
 
+; Имя новой записи. Знаки CP866 #B0..#DF (псевдографика) и #F2..#FF в длинное
+; имя не переводятся (OEM2UC знает латиницу и русские буквы, Ё/ё) — имя
+; недопустимо. Прежде они становились «ё»: RENAME сообщал успех под чужим
+; именем, а MOVE не находил созданную ссылку и оставлял вторую запись на
+; цепочке, которую следующий DELETE освобождал.
 VALIDATE_NAME:
         LD B,255
         LD DE,0
 .scan:
         LD A,(HL):OR A:JR Z,.terminated
         CALL @WDOS.ENCEN:JR Z,.bad
+        CP #B0:JR C,.known
+        CP #E0:JR C,.bad
+        CP #F2:JR NC,.bad
+.known:
         CP " ":JR Z,.next
         CP ".":JR Z,.next
         LD DE,HL
@@ -948,40 +1005,43 @@ VALIDATE_NAME:
         LD A,D:OR E:JR Z,.bad
         XOR A
         LD (DE),A
+; Имя — копия в NXTBU (зовёт только ENTREZ): ENTREZ копирует 256 байт, и за
+; концом имени лежал хвост буфера вызывающего — остатки прежнего имени.
+; Основа короткого имени (LONG) читает 8 знаков подряд и брала их. Хвост до
+; конца страницы NXTBU (#0000-#00FF) — нули.
+        EX DE,HL
+.zero:
+        INC HL
+        LD A,H:OR A
+        JR NZ,.zeroed
+        LD (HL),A
+        JR .zero
+.zeroed:
+        XOR A                                   ; Z — имя годно
         RET
 .bad:
         JP CLASSIFY_ORDINARY
 
+; Слот шлюза оставлен ради нумерации входов; ядро его больше не зовёт.
 BEGIN_LFN_COMPARE:
-        LD A,1:LD (LFN_LEADING),A
         RET
 
+; Сравнение длинного имени со знаком запроса (DE) — замена ULNP. Знак за знаком
+; без учёта регистра; начальные пробелы значимы, как в самом имени (CREATE их
+; сохраняет). Прежде (как в WC) они пропускались и в запросе, и в имени на
+; диске: « name» и «name» считались одним файлом — FIND, WRITE_AT, DELETE и
+; RENAME попадали в соседний файл, а MOVE из одного такого имени в другое
+; сообщал успех, ничего не сделав. Конец имени на диске (#0000, UCS даёт #FF)
+; не совпадает ни с каким знаком: прежде знак запроса #FF совпадал с ним, и
+; запрос на знак длиннее находил имя, если его конец приходился на последний
+; знак записи LFN.
+; CF=1 — знак совпал, сравнение продолжить; CF=0, Z — несовпадение; CF=0, NZ —
+; оба имени кончились вместе.
 COMPARE_LFN_CHAR:
-        LD A,(LFN_LEADING):OR A:JR Z,.normal
-.skip_query_spaces:
-        LD A,(DE):CP " ":JR NZ,.leading_stored
-        INC DE
-        JR .skip_query_spaces
-.leading_stored:
-        CALL @WDOS.UCS
-        OR A:JR Z,.mismatch
-        CP " ":JR Z,.continue
-        LD C,A
-        XOR A:LD (LFN_LEADING),A
-        LD A,C:CALL @WDOS.ACS:LD C,A
-        LD A,(DE):OR A:JR Z,.decoded_end
-        INC DE
-        CALL @WDOS.ACS
-        CP C:JR Z,.continue
-        JR .mismatch
-.decoded_end:
-        LD A,C:INC A:JR NZ,.mismatch
-        JR .matched
-
-.normal:
         LD A,(DE):INC DE:OR A:JR Z,.query_end
         CALL @WDOS.ACS:LD C,A
         CALL @WDOS.UCS:OR A:JR Z,.mismatch
+        CP #FF:JR Z,.mismatch                   ; имя на диске кончилось
         CALL @WDOS.ACS:CP C:JR Z,.continue
 .mismatch:
         XOR A
@@ -991,15 +1051,13 @@ COMPARE_LFN_CHAR:
         RET
 .query_end:
         CALL @WDOS.UCS:INC A:JR NZ,.mismatch
-.matched:
         XOR A:INC A
         RET
 
 ALLOCATE_FILE:
         LD A,D:OR E,H,L
         JR Z,.empty
-        CALL @WDOS.MKSG
-        RET
+        JP MKSG_CHECKED
 .empty:
         LD (@WDOS.FCTS),HL
         LD (@WDOS.FCTS+2),HL
@@ -1062,7 +1120,203 @@ VALIDATE_FREE_HINT:
         LD A,1:OR A
         RET
 
+; ---------------------------------------------------------------- геометрия
+; (только при монтировании — в окне кода, не в рабочей странице)
+
+; ---------------------------------------------------------------- записи по месту
+; Короткую запись в секторе DE:HL по смещению BC (0..511, кратно 32) —
+; удалённой (#E5) вместе с записями её длинного имени в том же секторе (они
+; идут подряд перед ней) — и убедиться: до трёх попыток «прочитать — пометить
+; — записать», затем перечитать. Удаление по имени для повтора не годится:
+; стерев длинное имя и не записав короткую, при повторе оно её уже не находит.
+; Выход: Z — на носителе #E5; NZ — не удалось либо смещение неизвестно (#FFFF).
+; Разрушает AF, BC, DE, HL и LOBU.
+ENTRY_KILL_AT:
+        LD A,B:CP 2:JR NC,.fail
+        LD A,C:AND #1F:JR NZ,.fail
+        LD (KILL_LBA),HL
+        LD (KILL_LBA+2),DE
+        LD (KILL_OFFSET),BC
+        LD A,4                                  ; три записи и проверка
+.try:
+        LD (KILL_LEFT),A
+        CALL .position
+        LD HL,@WDOS.LOBU,A,1
+        CALL READ_SECTORS
+        JR NZ,.next                             ; не прочитан — ещё раз
+        LD HL,@WDOS.LOBU,DE,(KILL_OFFSET)
+        ADD HL,DE
+        LD A,(HL):CP #E5:RET Z                  ; на носителе удалена
+        LD A,(KILL_LEFT):DEC A:JR Z,.fail       ; записей больше не будет
+        LD (HL),#E5
+        LD BC,(KILL_OFFSET)
+.lfn:                                           ; её длинное имя в этом секторе
+        LD A,B:OR C:JR Z,.write
+        LD A,C:SUB 32:LD C,A
+        LD A,B:SBC A,0:LD B,A
+        LD HL,@WDOS.LOBU:ADD HL,BC
+        LD A,(HL):CP #E5:JR Z,.write
+        PUSH HL
+        LD DE,11:ADD HL,DE
+        LD A,(HL)
+        POP HL
+        CP #0F:JR NZ,.write
+        LD (HL),#E5
+        JR .lfn
+.write:
+        CALL .position
+        LD HL,@WDOS.LOBU,A,1
+        CALL WRITE_SECTORS
+        RET Z                                   ; легла
+.next:
+        LD A,(KILL_LEFT):DEC A
+        JR NZ,.try
+.fail:
+        OR 1
+        RET
+.position:
+        LD HL,(KILL_LBA),DE,(KILL_LBA+2)
+        JP @WDOS.PROZ
+; Геометрия тома из BPB (LOAD_FREE_HINT). Вход: DE:HL — всего секторов. Без
+; переносов проверяются: конец тома (начало + всего; ровно 2**32 допустимо) в
+; 32-битном LBA; том не длиннее своего раздела MBR/EBR (PARTSZ; без раздела —
+; #FFFFFFFF, нулевая длина в таблице разделов — пустой раздел) и, у логического
+; тома, лежит внутри расширенного раздела (EXTBAS, EXTSZ) — прежде сложение
+; адреса в EBR заворачивалось, и том «находился» на чужом месте; область FAT
+; (резерв + число FAT × размер) совпадает с SDFAT; за ней есть хотя бы кластер;
+; номера кластеров — не больше #0FFFFFEF: прежде выданный номер #10000003 после
+; маски становился номером 3 чужого файла, а номера #0FFFFFF0…#0FFFFFF6 ссылки
+; FAT драйвер (как и WC) считает зарезервированными — созданный на них файл
+; потом не открывался; одной FAT хватает записей на все номера. Выход: Z,
+; DE:HL — исключающая граница номеров кластеров данных; NZ — BPB испорчен.
+GEOMETRY_CHECK:
+        LD (GEO_TOTAL),HL
+        LD (GEO_TOTAL+2),DE
+        LD BC,(@WDOS.ADDTOP):ADD HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.ADDTOP+2):ADC HL,BC
+        JR NC,.end_ok
+        LD A,H:OR L:OR D:OR E:JP NZ,.bad        ; дальше 2**32
+.end_ok:
+        LD HL,(@WDOS.PARTSZ),DE,(@WDOS.PARTSZ+2)
+        LD BC,(GEO_TOTAL):OR A:SBC HL,BC
+        EX DE,HL
+        LD BC,(GEO_TOTAL+2):SBC HL,BC
+        JP C,.bad                               ; том длиннее раздела
+        LD A,(@WDOS.EXTVOL):OR A:JR Z,.contained
+        LD HL,(@WDOS.ADDTOP),DE,(@WDOS.ADDTOP+2)
+        LD BC,(@WDOS.EXTBAS):OR A:SBC HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.EXTBAS+2):SBC HL,BC
+        EX DE,HL
+        JP C,.bad                               ; до начала расширенного раздела
+        LD BC,(GEO_TOTAL):ADD HL,BC
+        EX DE,HL
+        LD BC,(GEO_TOTAL+2):ADC HL,BC
+        EX DE,HL
+        JP C,.bad
+        PUSH DE                                 ; конец тома от начала раздела
+        PUSH HL
+        LD HL,(@WDOS.EXTSZ):POP BC:OR A:SBC HL,BC
+        LD HL,(@WDOS.EXTSZ+2):POP BC:SBC HL,BC
+        JP C,.bad                               ; за концом расширенного раздела
+.contained:
+        LD HL,(@WDOS.BREZS):LD DE,0
+        LD A,(@WDOS.BFATS):LD B,A
+.fat_area:
+        PUSH BC
+        LD BC,(@WDOS.BFTSZ):ADD HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.BFTSZ+2):ADC HL,BC
+        EX DE,HL
+        POP BC
+        JP C,.bad
+        DJNZ .fat_area
+        LD BC,(@WDOS.SDFAT):OR A:SBC HL,BC
+        JP NZ,.bad                              ; SDFAT посчитан с переносом
+        EX DE,HL
+        LD BC,(@WDOS.SDFAT+2):SBC HL,BC
+        JP NZ,.bad
+        LD HL,(GEO_TOTAL),DE,(GEO_TOTAL+2)
+        LD BC,(@WDOS.SDFAT):OR A:SBC HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.SDFAT+2):SBC HL,BC
+        EX DE,HL
+        JP C,.bad                               ; том кончается до области данных
+        LD A,(@WDOS.BSECPC)
+.divide:
+        CP 1:JR Z,.clusters
+        SRL D:RR E:RR H:RR L
+        SRL A
+        JR .divide
+.clusters:
+        LD A,D:OR E:OR H:OR L:JP Z,.bad         ; ни одного кластера
+        LD BC,2:CALL @WDOS.ADD4B                ; граница: кластеров + 2
+        LD A,D:CP #10:JP NC,.bad                ; 28 бит FAT32
+        CP #0F:JR NZ,.fat_size
+        LD A,E:CP #FF:JR NZ,.fat_size
+        LD A,H:CP #FF:JR NZ,.fat_size
+        LD A,L:CP #F1:JP NC,.bad                ; граница не дальше #0FFFFFF0
+; Одна FAT держит по записи на каждый номер ниже границы (128 на сектор).
+; Прежде том с короткой FAT монтировался, и номера без записи в FAT
+; считались годными.
+.fat_size:
+        PUSH HL
+        PUSH DE
+        LD BC,127:CALL @WDOS.ADD4B
+        LD B,7
+.need:
+        SRL D:RR E:RR H:RR L
+        DJNZ .need                              ; секторов FAT на все номера
+        PUSH DE
+        PUSH HL
+        LD HL,(@WDOS.BFTSZ):POP BC:OR A:SBC HL,BC
+        LD HL,(@WDOS.BFTSZ+2):POP BC:SBC HL,BC
+        POP DE
+        POP HL
+        JP C,.bad                               ; FAT короче
+        XOR A
+        RET
+.bad:
+        LD A,1:OR A
+        RET
+
+; Логический том текущего EBR (FHDD_EXTENDED, EBR — в LOBU): PARTSZ — длина
+; из его записи, DE:HL — начало тома (смещение от этого EBR), EXTCUR —
+; следующий EBR (ссылка от первого EBR; 0 — последний), EXTVOL=1. CF=1 —
+; начало тома за 2**32: EBR испорчен, обход кончается. Прежде перенос терялся,
+; и завёрнутый адрес указывал на другой том внутри расширенного раздела.
+; Ссылка на следующий EBR за 2**32 — конец цепочки.
+EBR_ENTRY:
+        LD HL,@WDOS.LOBU+446+12,DE,@WDOS.PARTSZ,BC,4:LDIR
+        LD HL,(@WDOS.LOBU+446+8),DE,(@WDOS.LOBU+446+8+2)
+        LD BC,(@WDOS.EXTCUR):ADD HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.EXTCUR+2):ADC HL,BC
+        EX DE,HL
+        RET C                                   ; начало тома за 2**32
+        PUSH DE
+        PUSH HL
+        LD HL,(@WDOS.LOBU+446+16+8),DE,(@WDOS.LOBU+446+16+8+2)
+        LD A,H:OR L:OR D:OR E
+        JR Z,.store                             ; последний EBR
+        LD BC,(@WDOS.EXTBAS):ADD HL,BC
+        EX DE,HL
+        LD BC,(@WDOS.EXTBAS+2):ADC HL,BC
+        EX DE,HL
+        JR NC,.store
+        LD HL,0:LD D,H:LD E,L                   ; за 2**32 — цепочка кончается
+.store:
+        LD (@WDOS.EXTCUR),HL
+        LD (@WDOS.EXTCUR+2),DE
+        LD A,1:LD (@WDOS.EXTVOL),A
+        POP HL
+        POP DE
+        OR A                                    ; CF=0
+        RET
+
 LOAD_FREE_HINT:
+        XOR A:LD (ROOT_READY),A                 ; новый том — цепочку корня заново
         LD HL,2:LD (@WDOS.FSTFRC),HL
         LD (FAT_DATA_CLUSTER_LIMIT),HL
         LD HL,0:LD (@WDOS.FSTFRC+2),HL
@@ -1075,21 +1329,8 @@ LOAD_FREE_HINT:
 .total32:
         LD HL,(@WDOS.LOBU+32),DE,(@WDOS.LOBU+34)
 .total_ready:
-        LD BC,(@WDOS.SDFAT)
-        OR A:SBC HL,BC
-        EX DE,HL
-        LD BC,(@WDOS.SDFAT+2)
-        SBC HL,BC
-        EX DE,HL
-        JR C,.done
-        LD A,(@WDOS.BSECPC)
-.divide:
-        CP 1:JR Z,.limit_ready
-        SRL D:RR E:RR H:RR L
-        SRL A
-        JR .divide
-.limit_ready:
-        LD BC,2:CALL @WDOS.ADD4B
+        CALL GEOMETRY_CHECK                     ; DE:HL — граница кластеров данных
+        JP NZ,.bad_geometry
         LD (FAT_DATA_CLUSTER_LIMIT),HL
         LD (FAT_DATA_CLUSTER_LIMIT+2),DE
         CALL SET_COLD_FREE_HINT
@@ -1118,6 +1359,9 @@ LOAD_FREE_HINT:
 .done:
         XOR A
         LD (@WDOS.ABT),A
+        RET
+.bad_geometry:
+        LD A,1:OR A                             ; NZ: LDBPB — как неверный BPB
         RET
 
 SET_COLD_FREE_HINT:
@@ -1155,12 +1399,19 @@ SAVE_NEXT_FREE_HINT:
         POP HL,DE,BC,AF
         RET
 
+; Начало DLSG: голова освобождаемой цепочки — подсказка поиска, только если это
+; допустимый кластер данных (прежде сюда попадал и отвергнутый затем кластер 1,
+; и поиск места сразу заявлял «места нет»); затем таблица цепочки корня для
+; CLASSIFY_DATA — до первой правки SECBU.
 NOTE_FREED_CHAIN:
         LD HL,(@WDOS.LOBU),DE,(@WDOS.LOBU+2)
         LD A,D:OR E:OR H:OR L:RET Z
+        CALL VALIDATE_FREE_HINT
+        JR NZ,.root
         LD (@WDOS.FSTFRC),HL
         LD (@WDOS.FSTFRC+2),DE
-        RET
+.root:
+        JP ROOT_SETUP
 
 POSITION_FAT_INDEX:
         OR A:JR Z,.base
@@ -1233,12 +1484,24 @@ INIT_FREE_SCAN:
         LD HL,(@WDOS.CADE)
         LD (@WDOS.DAHL),HL
         XOR A:LD (@WDOS.DUBA),A
+        LD (FREE_SCAN_IO_FAILED),A               ; отказов чтения FAT ещё не было
         RET
 
+; Слот курсора CAHL перед проверкой (FC ядра). Кластер вне области данных
+; тома (последний сектор FAT держит слоты за её концом, испорченная подсказка)
+; не выдаётся: переход к кластеру 2 (NEXT_FREE_FAT_SECTOR.wrap) — тогда HL —
+; его слот. Обход замкнулся (после перехода курсор дошёл до начала поиска) —
+; CF=1, места нет. HL — слот, сохраняется; портит A, BC, DE.
 CHECK_FREE_SCAN_LIMIT:
-        LD A,(@WDOS.DUBA):OR A:RET Z
         PUSH HL
-        LD HL,(@WDOS.CAHL),DE,(@WDOS.DABC)
+        LD HL,(@WDOS.CAHL),DE,(@WDOS.CADE)
+        CALL VALIDATE_FREE_HINT
+        JR Z,.valid
+        POP HL
+        JP NEXT_FREE_FAT_SECTOR.wrap
+.valid:
+        LD A,(@WDOS.DUBA):OR A:JR Z,.more
+        LD DE,(@WDOS.DABC)
         OR A:SBC HL,DE:JR NZ,.more
         LD HL,(@WDOS.CADE),DE,(@WDOS.DAHL)
         OR A:SBC HL,DE:JR NZ,.more
@@ -1250,29 +1513,21 @@ CHECK_FREE_SCAN_LIMIT:
         OR A
         RET
 
+; Сектор FAT курсора CAHL (SRHFC ядра): HL — слот курсора, CF=0. Курсор вне
+; области данных — переход к кластеру 2 (один раз за поиск); второй раз или
+; поиск начат с 2 — CF=1, места нет. Отказ чтения FAT — CF=1 и код в
+; FREE_SCAN_IO_FAILED (MKSG_CHECKED, DIR_GROW: отказ носителя, не «нет места»).
+; Прежде следующий сектор брался по LSTSE без проверки курсора.
 NEXT_FREE_FAT_SECTOR:
-        LD HL,(@WDOS.LSTSE),DE,(@WDOS.LSTSE+2)
-        INC HL
-        LD A,H:OR L:JR NZ,.next_sector_ready
-        INC DE
-.next_sector_ready:
-
-        PUSH HL,DE
-        LD BC,(@WDOS.BFTSZ)
-        OR A:SBC HL,BC
-        EX DE,HL
-        LD BC,(@WDOS.BFTSZ+2)
-        SBC HL,BC
-        POP DE,HL
-        JR NC,.wrap
-
-        LD (@WDOS.LSTSE),HL,(@WDOS.LSTSE+2),DE
-        CALL POSITION_FAT_READ
-        LD HL,@WDOS.SECBU,A,1
-        CALL READ_SECTORS
-        RET NZ
-        LD HL,@WDOS.SECBU
-        OR A
+        LD HL,(@WDOS.CAHL),DE,(@WDOS.CADE)
+        CALL VALIDATE_FREE_HINT
+        JR NZ,.wrap
+.read:
+        CALL @WDOS.CURIT
+        RET NC
+        LD A,(@WDOS.ABT)
+        LD (FREE_SCAN_IO_FAILED),A
+        SCF
         RET
 
 .wrap:
@@ -1281,13 +1536,15 @@ NEXT_FREE_FAT_SECTOR:
         LD A,H:OR L:JR NZ,.do_wrap
         LD HL,(@WDOS.DABC)
         LD A,H:OR A:JR NZ,.do_wrap
-        LD A,L:CP 3:JR C,.full
+        ; Поиск начат ровно с 2 — пройдено всё. С 0 или 1 (недопустимая
+        ; подсказка) от 2 ещё не искали: прежде это тоже считалось полным обходом.
+        LD A,L:CP 2:JR Z,.full
 .do_wrap:
         LD A,1:LD (@WDOS.DUBA),A
         LD HL,2:LD (@WDOS.CAHL),HL
         LD HL,0:LD (@WDOS.CADE),HL
         LD DE,0:LD HL,2
-        JP @WDOS.CURIT
+        JR .read
 .full:
         SCF
         RET
@@ -1318,9 +1575,20 @@ PRESERVE_OLDER_DIR_SECTOR:
         POP HL,DE,BC,AF
         RET
 
+; Указатель записи LFN при обратном проходе (LNPARZ). LOBU и LOBU2 идут
+; подряд; ниже LOBU — позапрошлый сектор, его копия в DIR_OLDER_BUFFER: адрес
+; #31xx переводится в #21xx. Прежде допускался только этот первый перевод, и
+; следующая запись (#21C0 и ниже) отвергалась: имя, чьи записи LFN занимали
+; три сектора, не находилось, и ENTRY_LANDED принимал легшую запись за
+; отсутствующую — цепочку освобождали под живой записью.
 MAP_OLDER_LFN_POINTER:
         LD A,H:CP high @WDOS.LOBU:JR NC,.ok
-        CP high @WDOS.LOBU-1:JR NZ,.bad
+        CP high @WDOS.LOBU-1:JR Z,.enter
+        CP high DIR_OLDER_BUFFER:JR C,.bad      ; уже в DIR_OLDER_BUFFER?
+        CP high (DIR_OLDER_BUFFER+512):JR NC,.bad
+        LD A,(DIR_OLDER_VALID):OR A:JR Z,.bad
+        JR .ok
+.enter:
         LD A,(DIR_OLDER_VALID):OR A:JR Z,.bad
         LD A,H:SUB #10:LD H,A
 .ok:
@@ -1746,8 +2014,10 @@ APPEND_OLD_LINK:              DS 4
 APPEND_FAT_POINTER:           DS 2
 APPEND_SLOT_POINTER:          DS 2
 APPEND_LAST_ERROR:            DS 1
+KILL_LBA:                     DS 4
+KILL_OFFSET:                  DS 2
+KILL_LEFT:                    DS 1
 
-LFN_LEADING            EQU @WDOS.EXT_LFN_LEADING
 DIR_PREVIOUS_LBA       EQU @WDOS.EXT_DIR_PREVIOUS_LBA
 DIR_OLDER_LBA          EQU @WDOS.EXT_DIR_OLDER_LBA
 DIR_OLDER_VALID        EQU @WDOS.EXT_DIR_OLDER_VALID

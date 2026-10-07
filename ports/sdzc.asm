@@ -5,11 +5,17 @@
         ORG #3900
 PORT_TABLE:
         DW SD_INIT,SD_READ,SD_WRITE,SD_SYNC
+; #3908: 1 — проверять CRC16 прочитанных секторов (по умолчанию), 0 — нет
+; (сверка — около 40 тысяч тактов на сектор; для приложений, которым скорость
+; важнее).
+SD_CRC_CHECK:
+        DB 1
 SD_DATA EQU #0057
 SD_CONF EQU #0077
 SD_ERROR_TIMEOUT EQU #E1
 SD_ERROR_REPLY   EQU #E2
 SD_ERROR_RANGE   EQU #E3
+SD_ERROR_CRC     EQU #E4
 
 SD_INIT:
         OR A
@@ -154,17 +160,34 @@ SD_READ:
         CALL SD_COMMAND
         JR C,SD_FAILED
         OR A
-        JR NZ,SD_BAD_REPLY
+        JP NZ,SD_BAD_REPLY
         CALL SD_WAIT_TOKEN
         JR C,SD_FAILED
         CP #FE
-        JR NZ,SD_BAD_REPLY
+        JP NZ,SD_BAD_REPLY
         LD HL,(SD_BUFFER)
         LD BC,SD_DATA
         INIR
         INIR
-        IN A,(C)
-        IN A,(C)
+        IN D,(C)                        ; CRC16 блока от карты
+        IN E,(C)
+        ; Блок, чья CRC не совпала с данными, — отказ чтения: прежде искажённый
+        ; при передаче сектор принимался, и дозапись или правка FAT записывали
+        ; его обратно. #FFFF — CRC нет (так отвечает эмулятор Unreal); у
+        ; настоящей карты такая CRC — один сектор из 65536.
+        LD A,(SD_CRC_CHECK)
+        OR A
+        JR Z,SD_SUCCESS
+        LD A,D:AND E:INC A
+        JR Z,SD_SUCCESS
+        PUSH DE
+        LD HL,(SD_BUFFER)
+        CALL SD_CRC
+        POP HL
+        OR A:SBC HL,DE
+        JR Z,SD_SUCCESS
+        LD A,SD_ERROR_CRC
+        JR SD_FAILED
 SD_SUCCESS:
         XOR A
 SD_FAILED:
@@ -196,6 +219,16 @@ SD_WRITE:
         JR NZ,SD_BAD_REPLY
         CALL SD_WAIT_READY
         JR C,SD_FAILED
+        ; «Принято» и конец занятости не подтверждают программирование
+        ; сектора: его ошибку карта сообщает только в статусе (CMD13, R2).
+        ; Прежде такая запись считалась удачной.
+        LD A,13,DE,0,HL,0
+        CALL SD_COMMAND
+        JR C,SD_FAILED
+        LD E,A
+        IN A,(C)                        ; второй байт R2
+        OR E
+        JR NZ,SD_BAD_REPLY
         JR SD_SUCCESS
 SD_SYNC:
         CALL SD_SELECT_CARD
@@ -294,12 +327,67 @@ SD_WAIT_TOKEN:
 .ready:
         OR A
         RET
+; CRC16-CCITT (x^16+x^12+x^5+1, начальное 0) 512 байт по HL — как у
+; блока данных SD. Выход: DE. Разрушает AF, BC, HL. Конец буфера — по
+; адресу (самоизменение сравнений): младший байт снова прежний, старший +2.
+SD_CRC:
+        LD A,L
+        LD (.lo+1),A
+        LD A,H
+        ADD A,2
+        LD (.hi+1),A
+        LD DE,0
+        LD B,high SD_CRC_HI
+.byte:
+        LD A,(HL)
+        INC HL
+        XOR D
+        LD C,A
+        LD A,(BC)                       ; старший байт T[i]
+        XOR E
+        LD D,A
+        INC B
+        LD A,(BC)                       ; младший байт T[i]
+        LD E,A
+        DEC B
+        LD A,L
+.lo:    CP 0
+        JR NZ,.byte
+        LD A,H
+.hi:    CP 0
+        JR NZ,.byte
+        RET
+
 SD_BUFFER: DS 2
 SD_RETRIES: DS 2
 SD_BLOCK_ADDRESS: DB 0
 SD_V2: DB 0
 SD_MMC: DB 0
 SD_COMMAND_BYTE: DB 0
+
+; Таблица CRC16 по старшему байту: T[i] = CRC от i<<8 (8 сдвигов), страницы
+; старших и младших байтов подряд. Считается ассемблером.
+        ALIGN 256
+SD_CRC_HI:
+CRC_I = 0
+        DUP 256
+CRC_C = CRC_I << 8
+        DUP 8
+CRC_C = ((CRC_C << 1) & #FFFF) ^ (((CRC_C >> 15) & 1) * #1021)
+        EDUP
+        DB CRC_C >> 8
+CRC_I = CRC_I + 1
+        EDUP
+SD_CRC_LO:
+CRC_I = 0
+        DUP 256
+CRC_C = CRC_I << 8
+        DUP 8
+CRC_C = ((CRC_C << 1) & #FFFF) ^ (((CRC_C >> 15) & 1) * #1021)
+        EDUP
+        DB CRC_C & #FF
+CRC_I = CRC_I + 1
+        EDUP
 PORT_END:
         ASSERT PORT_END <= #4000
         SAVEBIN "build/port_sdzc.bin",PORT_TABLE,PORT_END-PORT_TABLE
