@@ -121,13 +121,11 @@ FILEX_VALIDATE_BUFFER:
         RET
 
 FILEX_LOAD_CONTEXT:
-        LD DE,@WDOS.LOBU
+        LD DE,FILEX_CONTEXT
         XOR A
         FILEX_CALL_EXTENSION ID_FILEX_CONTEXT_BRIDGE
         JR Z,.no_context
-        LD HL,@WDOS.LOBU,DE,FILEX_CONTEXT,BC,FILEX_CONTEXT_SIZE
-        LDIR
-        CALL FILEX_VERIFY_CONTEXT
+        CALL FILEX_VERIFY_CACHED
         RET NZ
         ; Цепочка файла — один раз на выбор (FILE_CHAIN_GUARD): цикл уводил
         ; WRITE_AT в начало файла, а усечение освобождало оставляемые кластеры.
@@ -228,13 +226,8 @@ FILEX_NEXT_CLUSTER:
         LD (@WDOS.ABT),A
         LD HL,(FILEX_CURRENT_CLUSTER)
         LD DE,(FILEX_CURRENT_CLUSTER+2)
-        CALL @WDOS.CURIT
+        CALL WDOS_EXT.CHAIN_VALUE
         JR C,.fat_read_failed
-        LD E,(HL):INC HL
-        LD D,(HL):INC HL
-        LD A,(HL):INC HL
-        LD H,(HL),L,A
-        EX DE,HL
         ; В томе и не кластер корня: FAT могли изменить после выбора файла,
         ; и WRITE_AT писал бы в корень.
         CALL WDOS_EXT.CLASSIFY_FILE_LINK
@@ -278,34 +271,7 @@ FILEX_LOCATE_OFFSET:
         SRL A
         JR .divide_cluster
 .cluster_index_ready:
-        LD (FILEX_CLUSTER_SKIP),HL
-        LD (FILEX_CLUSTER_SKIP+2),DE
-
-        LD HL,(FILEX_FIRST_CLUSTER)
-        LD DE,(FILEX_FIRST_CLUSTER+2)
-        CALL FILEX_CLASSIFY_LINK
-        JR C,.fat_error
-        JR Z,.fat_error
-        LD (FILEX_CURRENT_CLUSTER),HL
-        LD (FILEX_CURRENT_CLUSTER+2),DE
-
-.walk:
-        LD HL,(FILEX_CLUSTER_SKIP)
-        LD DE,(FILEX_CLUSTER_SKIP+2)
-        LD A,D:OR E:OR H:OR L:JR Z,.ready
-        CALL FILEX_NEXT_CLUSTER
-        RET NZ
-        LD HL,(FILEX_CLUSTER_SKIP)
-        DEC HL
-        LD (FILEX_CLUSTER_SKIP),HL
-        LD A,H:AND L:CP #FF:JR NZ,.walk
-        LD HL,(FILEX_CLUSTER_SKIP+2)
-        DEC HL
-        LD (FILEX_CLUSTER_SKIP+2),HL
-        JR .walk
-.ready:
-        XOR A
-        RET
+        JP FILEX_LOCATE_CACHED
 .fat_error:
         LD A,FILEX_STATUS_FAT
         OR A
@@ -451,9 +417,6 @@ FILEX_READ_AT:
 .loop:
         CALL FILEX_POSITION_CURRENT
         JP NZ,FILEX_FINISH
-        LD HL,@WDOS.LOBU
-        CALL FILEX_READ_ONE
-        JP NZ,FILEX_FINISH
 
         LD HL,512
         LD DE,(FILEX_BYTE_OFFSET)
@@ -466,13 +429,8 @@ FILEX_READ_AT:
         LD H,D,L,E
 .chunk_ready:
         LD (FILEX_CHUNK),HL
-        LD BC,(FILEX_BYTE_OFFSET)
-        LD HL,@WDOS.LOBU
-        ADD HL,BC
-        LD DE,(FILEX_BUFFER_POINTER)
-        LD BC,(FILEX_CHUNK)
-        LDIR
-        LD (FILEX_BUFFER_POINTER),DE
+        CALL FILEX_READ_CHUNK
+        JP NZ,FILEX_FINISH
 
         LD HL,(FILEX_RESULT)
         LD DE,(FILEX_CHUNK)

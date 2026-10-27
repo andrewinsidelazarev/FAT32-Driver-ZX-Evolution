@@ -271,7 +271,8 @@ LNCRC   XOR A
          RRCA:ADD A,(HL):INC L
  EDUP
         RET
-NXTINI  LD HL,1
+NXTINI  CALL @FILEX_NEW_GENERATION
+        LD HL,1
         LD (CGFL),HL
 
         ; Цепочка каталога проверяется до перечисления (DIR_LIST_OPEN):
@@ -299,6 +300,7 @@ APPEND  CALL_WDOS_EXTENSION WDOS_EXT.ID_APPEND_BYTES
 Z0      RET
 
 GLSTCAT
+        CALL @FILEX_NEW_GENERATION
         LD DE,LSTCAT,BC,4:LDIR
         LD (CGFL),BC
         RET
@@ -431,7 +433,7 @@ GETZE   EXX
         RET
 
 CURIT
-
+        XOR A:LD (@FILEX_FAT_VALID),A
         CALL DEL128
  DUP 2
          SLA C:RL B
@@ -448,6 +450,7 @@ JK      CALL_WDOS_EXTENSION WDOS_EXT.ID_POSITION_FAT_READ
         JR C,FATEND
         POP BC
         LD HL,SECBU:ADD HL,BC
+        LD A,1:LD (@FILEX_FAT_VALID),A
         XOR A
         RET
 FATEND  POP BC

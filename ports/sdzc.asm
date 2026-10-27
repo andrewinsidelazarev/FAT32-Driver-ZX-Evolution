@@ -389,5 +389,5 @@ CRC_C = ((CRC_C << 1) & #FFFF) ^ (((CRC_C >> 15) & 1) * #1021)
 CRC_I = CRC_I + 1
         EDUP
 PORT_END:
-        ASSERT PORT_END <= #4000
+        ASSERT PORT_END <= #3E00             ; далее отдельный кэш данных FILEX
         SAVEBIN "build/port_sdzc.bin",PORT_TABLE,PORT_END-PORT_TABLE

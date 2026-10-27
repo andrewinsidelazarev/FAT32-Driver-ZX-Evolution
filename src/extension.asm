@@ -113,6 +113,7 @@ STREAM_WITH_HANDLER:
         RET
 
 COPY_ENTRY_AND_CAPTURE:
+        CALL @FILEX_NEW_GENERATION
         PUSH AF
         PUSH DE
         EXX
@@ -162,6 +163,7 @@ FILEX_CONTEXT_BRIDGE:
         LD A,1:OR A
         RET
 .invalidate:
+        CALL @FILEX_NEW_GENERATION
         XOR A
         LD (APPEND_VALID),A
         LD (APPEND_READY),A
@@ -169,6 +171,7 @@ FILEX_CONTEXT_BRIDGE:
         LD (FILE_CHAIN_OK),A
         RET
 .import:
+        CALL @FILEX_NEW_GENERATION
         LD DE,APPEND_DIRECTORY_LBA,BC,38
         LDIR
         XOR A

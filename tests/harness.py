@@ -178,6 +178,7 @@ class Driver:
         # Рабочая страница: в ней код проверок safety.asm (и таблица порта SD-ZC).
         self.cpu.set_memory_block(0x0000, (build/'fat32-work.bin').read_bytes())
         self.operations, self.fail, self.syncs = [], None, 0
+        self.transfers = []
         for address in (STOP,INIT,READ,WRITE,SYNC):
             self.cpu.set_breakpoint(address)
         table=PARAM
@@ -197,6 +198,7 @@ class Driver:
         return self.cpu.a, bool(self.cpu.f&64), bool(self.cpu.f&1)
 
     def call(self, slot, **regs):
+        self.last_ticks = 0
         self.cpu.sp, self.cpu.pc = STACK, 0x4000+3*slot if isinstance(slot,int) else self.sym[slot]
         self.ram[STACK:STACK+2] = STOP.to_bytes(2,'little')
         for name, value in regs.items():
@@ -204,6 +206,10 @@ class Driver:
         for _ in range(getattr(self, 'max_events', 40000)):
             self.cpu.ticks_to_stop = 1_000_000
             event = self.cpu.run()
+            # В установленной модели getter ticks_to_stop содержит опечатку;
+            # берём тот же 32-битный счётчик из представления состояния.
+            left = int.from_bytes(self.cpu._StateBase__ticks_to_stop, 'little')
+            self.last_ticks += (1_000_000 - left) & 0xFFFFFFFF
             if not event & 2:
                 continue
             if self.cpu.pc == STOP:
@@ -217,6 +223,7 @@ class Driver:
         if pc in (READ,WRITE):
             op = 'read' if pc == READ else 'write'
             self.operations.append((op,lba))
+            self.transfers.append((op, lba, buffer))
             if self.fail and self.fail(op,lba):
                 status = 0xE1
             elif pc == READ:

@@ -35,7 +35,7 @@ def main():
            if (m := line.split(': EQU ')) and len(m) == 2}
     low = (BUILD/'fat32-low.bin').read_bytes()
     low_start, low_end = sym['FAT32_LOW_CODE'], sym['FAT32_LOW_END']
-    if not (384 <= len(image) <= 16384 and len(port) <= 0x700):
+    if not (384 <= len(image) <= 16384 and len(port) <= 0x500):
         raise SystemExit('Образы драйвера не помещаются в выделенные окна памяти.')
     if not (0x2000 <= low_start and low_start + len(low) <= low_end <= 0x3000):
         raise SystemExit('Код safety.asm не помещается в рабочую страницу.')
@@ -49,6 +49,10 @@ def main():
         'api_base':16384, 'api_version':1, 'command_count':128,
         'reserved_first':78, 'code_limit':32768, 'code_free_bytes':16384-len(image),
         'low_code':low_start, 'low_free_bytes':low_end-low_start-len(low),
+        'zero_scratch_bytes':sym['FAT32_ZERO_SCRATCH_SIZE'],
+        'filex_points':{'address':sym['FILEX_POINTS'], 'count':64, 'stride_clusters':64},
+        'filex_data_cache':{'address':sym['FILEX_DATA_BUFFER'], 'size':512},
+        'port_limit':0x3E00,
         'artifacts':{name:{'size':(BUILD/name).stat().st_size,
                            'sha256':hashlib.sha256((BUILD/name).read_bytes()).hexdigest()}
                      for name in ('fat32.bin','fat32-low.bin','fat32-work.bin','port_sdzc.bin')},

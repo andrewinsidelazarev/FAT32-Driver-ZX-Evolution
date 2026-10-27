@@ -32,6 +32,7 @@ BLOCK_JUMPS:
         JP BLOCK_WRITE
         JP BLOCK_READ256
 BLOCK_SELECT:
+        CALL FILEX_MEDIA_CHANGED
         LD (BLOCK_UNIT),A
         XOR A
         RET
@@ -48,6 +49,11 @@ BLOCK_INIT:
         JP (HL)
 BLOCK_SYNC:
         LD HL,(BLOCK_CALLBACKS+6)
+        CALL .invoke
+        OR A
+        CALL NZ,FILEX_MEDIA_CHANGED
+        RET
+.invoke:
         JP (HL)
 BLOCK_READ:
         PUSH DE
@@ -56,6 +62,9 @@ BLOCK_READ:
 BLOCK_WRITE:
         PUSH DE
         LD DE,(BLOCK_CALLBACKS+4)
+        PUSH AF
+        LD A,2                          ; отдельный режим: сброс перед каждым сектором
+        JR BLOCK_MODE
 BLOCK_LINEAR:
         PUSH AF
         XOR A
@@ -85,22 +94,25 @@ BLOCK_TRANSFER:
         PUSH HL
         LD B,H,C,L
         LD A,(BLOCK_VIDEO)
-        OR A
-        JR Z,.buffer_ready
+        CP 1
+        JR NZ,.buffer_ready
         LD BC,WDOS.LOBU2
 .buffer_ready:
+        CALL FILEX_BUFFER_REUSED
         LD HL,(BLOCK_LBA)
         LD DE,(BLOCK_LBA+2)
 BLOCK_CALL:
         CALL 0
         LD (WDOS.ABT),A
+        OR A
+        CALL NZ,FILEX_MEDIA_CHANGED
         POP HL
         POP BC
         OR A
         JR NZ,.failed
         LD A,(BLOCK_VIDEO)
-        OR A
-        JR NZ,.video
+        CP 1
+        JR Z,.video
         INC H
         INC H
         JR .position

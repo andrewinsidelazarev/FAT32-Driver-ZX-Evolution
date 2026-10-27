@@ -4,8 +4,8 @@
 ; процедуры напрямую, без шлюза: шлюз драйвера возвращает в HL' и BC' не то,
 ; что оставила функция, а DIR_GROW отдаёт продолжение поиска свободного
 ; кластера именно в HL'.
-; Не перенесены (не защищают данные или требуют памяти, которой нет): время
-; записей по часам, кэш секторов FAT. Цепочку корня WC держит в таблице на
+; Время записей по часам не перенесено. С 2026-10-27 сектор FAT общий для
+; обхода цепочек и FILEX (FILEX_FAT_VALID). Цепочку корня WC держит в таблице на
 ; 3 КиБ; здесь таблица на 64 кластера, дальше — обход цепочки (ROOT_MEMBER).
 ; Сверх WC: цепочка выбранного файла проверяется до первой операции с данными
 ; (FILE_CHAIN_GUARD), поиск длинного имени проходит позапрошлый сектор целиком,
@@ -343,7 +343,6 @@ FILE_CHAIN_CHECK:
         LD (HL),0:INC HL                        ; CHAIN_POWER и CHAIN_LAM
         DJNZ .zero
         LD A,1:LD (CHAIN_POWER),A
-        XOR A:LD (DIR_CHAIN_READ),A
         POP DE
         POP HL
         CALL CLASSIFY_IN_VOLUME
@@ -483,7 +482,6 @@ DIR_CHAIN:
         JR Z,.bad                               ; маркер конца вместо кластера
         LD BC,4096
         LD (DIR_CHAIN_LEFT),BC
-        XOR A:LD (DIR_CHAIN_READ),A
         CALL IS_ROOT_START                      ; Z — сам корень
         LD A,0:JR Z,.kind
         PUSH HL
@@ -517,12 +515,13 @@ DIR_CHAIN:
         OR 1
         RET
 
-; Значение записи FAT кластера DE:HL. Сектор FAT читается CURIT в первый раз
-; за обход и затем, только когда сменился (DIR_CHAIN_READ): каталогу в одном
-; секторе FAT — одно чтение. Выход: DE:HL — значение, CF=0; CF=1 — отказ
-; чтения. Разрушает AF, BC.
+; Значение записи FAT кластера DE:HL. CURIT устанавливает FILEX_FAT_VALID
+; после успешного чтения; адаптер снимает метку перед чужим чтением в SECBU,
+; любой записью и при ошибке. Сектор сохраняется между вызовами FILEX и
+; проверками цепочки. Выход: DE:HL — значение, CF=0; CF=1 — отказ чтения.
+; Разрушает AF, AF', BC (DEL128 пользуется альтернативным аккумулятором).
 CHAIN_VALUE:
-        LD A,(DIR_CHAIN_READ):OR A
+        LD A,(@FILEX_FAT_VALID):OR A
         JR Z,.read
         PUSH DE
         PUSH HL
@@ -543,7 +542,6 @@ CHAIN_VALUE:
 .read:
         CALL @WDOS.CURIT                        ; HL — запись FAT кластера
         RET C
-        LD A,1:LD (DIR_CHAIN_READ),A
 .value:
         LD E,(HL):INC HL:LD D,(HL):INC HL
         LD A,(HL):INC HL:LD H,(HL):LD L,A
@@ -1042,6 +1040,7 @@ RENAME_OLD_GONE:
 ; неизвестен, откат не удался): снять выбор файла, контекст APPEND и поток
 ; READ/WRITE — до нового FIND. AF сохраняется.
 CONTEXT_FORGET:
+        CALL @FILEX_NEW_GENERATION
         PUSH AF
         LD A,(@FAT_SELECTED):LD (FORGOT_SELECTED),A
         XOR A
@@ -1222,7 +1221,6 @@ APPEND_DIR_OUTCOME:
 
 ; ---------------------------------------------------------------- данные
 DIR_CHAIN_LEFT:         DS 2
-DIR_CHAIN_READ:         DS 1
 DIR_CHAIN_SUB:          DS 1
 FREE_SCAN_IO_FAILED:    DS 1
 RENAME_OLD_LBA:         DS 4

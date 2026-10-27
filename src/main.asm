@@ -4,11 +4,12 @@
         INCLUDE "extension_ids.inc"
 
 ; Рабочая страница #0000-#3FFF (fat32-work.bin): GENBU/NXTBU #0000-#1FFF,
-; нулевой буфер FILEX #2000-#23FF (он же DIR_OLDER_BUFFER #2000-#21FF), код и
-; таблицы проверок сохранности данных (src/safety.asm) #2400-#2FFF, SECBU
-; #3000, LOBU #3200, LOBU2 #3400, переменные ядра с #3800, таблица порта с #3900.
+; нулевой буфер FILEX #2000-#21FF (он же DIR_OLDER_BUFFER), код и таблицы
+; safety.asm/filex_cache.asm #2200-#2FFF, SECBU #3000, LOBU #3200, LOBU2 #3400,
+; вехи FILEX #3600-#36FF, курсоры с #37F8, переменные ядра с #3800,
+; SD-ZC #3900-#3DFF (включая CRC16), кэш сектора данных #3E00-#3FFF.
 FAT32_ZERO_SCRATCH      EQU #2000
-FAT32_ZERO_SCRATCH_SIZE EQU #0400
+FAT32_ZERO_SCRATCH_SIZE EQU #0200
 FAT32_LOW_CODE          EQU FAT32_ZERO_SCRATCH+FAT32_ZERO_SCRATCH_SIZE
 FAT32_LOW_END           EQU #3000
 
@@ -110,6 +111,7 @@ LOW_IMAGE:
         MODULE WDOS_EXT
         INCLUDE "safety.asm"
         ENDMODULE
+        INCLUDE "filex_cache.asm"
 LOW_END:
         ENT
         ASSERT LOW_END <= FAT32_LOW_END, safety code exceeds the work-page window
